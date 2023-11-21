@@ -1,51 +1,75 @@
 import batman
 import numpy as np
-# import minimint
+import minimint
 import emcee
 from scipy.optimize import minimize
 import pickle 
 import keplersplinev2
 import pandas as pd
 import matplotlib.pyplot as plt
+import detrend
+from sed_model import sed_model
+from batman_model import batman_model
+
+
+rsun = 69634000000.
+msun = 1.989*10**33
+G = 6.67*10**-8
+
+filters = ['Tycho_B','Tycho_V', "2MASS_J","2MASS_H","2MASS_Ks","Gaia_G_DR2Rev","Gaia_BP_EDR3", 'Gaia_RP_EDR3']
+ii = minimint.Interpolator(filters)
+
+
 
 class TransitFit:
-    def __init__(self, t, y, yerr, limb_darkening_coeff, ndim=7):
-        # store tess data in self object
-        self.t = t # time [bjd - 2457000]
-        self.y = y # normalized flux -- right now this is flattened, come back and make it detrend simultaneously 
-        self.yerr = yerr # flux err 
-        self.limb_darkening_coeff = limb_darkening_coeff # fix limbdarkening params from 
-        self.ndim = ndim
+    def __init__(self, observations, 
+                 obs_mags, obs_mags_err, 
+                 limb_darkening_coeff, labels, num_planets =1):
+
+        # take in a dictionary of data from multiple instruments 
+        self.observations = observations
         
-    def transit_model(self, theta):
-        model_flux = np.ones_like(self.t)
-#         print(len(theta), 'here are the theta values',theta)
+        # fix limbdarkening params from clare (2017)-- T for tess and Kp for CHEOPS
+        self.limb_darkening_coeff = limb_darkening_coeff 
+       
+        # incorportate SED FIT
+        self.obs_mags = obs_mags
+        self.obs_mags_err = obs_mags_err
+        self.labels = labels
+        self.n_planets = num_planets
         
-        n_planets = len(theta) // self.ndim
-        theta = np.reshape(theta, (n_planets, -1))
+        print('self has been assigned', self)
         
-        for n in range(n_planets):
-            planet_params = theta[n]
-            params = batman.TransitParams()
-            params.t0 = planet_params[0]
-            params.per = planet_params[1]
-            params.rp = planet_params[2]
-            params.a = planet_params[3]
-            params.inc = planet_params[4]
-            params.ecc = np.sqrt(planet_params[5]**2 + planet_params[6]**2)
-            params.w = np.arctan2(planet_params[6], planet_params[5])
-            params.limb_dark = 'quadratic'
-            params.u = self.limb_darkening_coeff
-            
-            tmod = batman.TransitModel(params, self.t)
-            model_flux *= tmod.light_curve(params)
-            
-        return model_flux
+    def transit_model(self, theta, i):
+        return batman_model(self, theta, i)
     
+    def sed_fit(self,theta):
+        sim_mags, dist_mod = sed_model(self, theta)
+        chisq = np.nansum(((sim_mags + dist_mod) - self.obs_mags) ** 2 / self.obs_mags_err ** 2)
+        return chisq
+       
     def ln_like(self, theta):
-        model = self.transit_model(theta)
-        chisq = np.nansum((self.y - model) **2 / self.yerr**2) # come back and add jitter term 
-        return -0.5 * chisq
+
+        chisq = np.array([])
+        for i in range(len(self.observations)):
+            y_obs = self.observations[i]['y']
+            yerr_obs = self.observations[i]['yerr']
+            model = self.transit_model(theta, i)
+            
+            inst_name = self.observations[i]['inst_name']
+            jitter = theta[self.labels.index(f'jitter_'+inst_name)]
+            chisq_transit = np.nansum((y_obs - model) **2 / np.sqrt(yerr_obs**2 + theta[-1]**2)**2)
+            if np.abs(chisq_transit) < 0.0001:
+                return -np.inf
+            
+            chisq = np.append(chisq, chisq_transit)
+            
+        chisq_sed = self.sed_fit(theta)
+        chisq = np.append(chisq, chisq_sed)
+        chisq = np.nansum(chisq)
+        if np.abs(chisq) < 0.0001:
+            return -np.inf
+        return -0.5 * np.nansum(chisq)
     
     def ln_prior(self, theta, bounds):
         # check if the values are within the defined bounds
@@ -64,6 +88,12 @@ class TransitFit:
     
     
     def fit_transit(self, nwalkers, theta0, bounds, nsteps=500, burn_in=250):
+        
+        ndim = len(theta0)
+#         print('we are here, about to make a matrix for theta0', theta0)
+        theta0 = np.tile(theta0, (nwalkers, 1)) + 1e-4 * np.random.rand(nwalkers, ndim)
+        self.ndim = ndim
+#         print('about to run the sampler')
         sampler = emcee.EnsembleSampler(nwalkers, self.ndim, self.ln_posterior, args=(bounds,))
 
         # run mcmc
@@ -85,42 +115,9 @@ class TransitFit:
         # Calculate median and percentiles
         derived_params = np.median(samples, axis=0)
         uncertainties = np.percentile(samples, [16, 84], axis=0) - derived_params
+        
+        # add calculate teff and rstar and rp
 
         return derived_params, uncertainties
-        
-data = pd.read_csv('toi5358_data/46631742.csv')
-t = data['Time (BTJD)'].values
-y = data['SAP_FLUX_DEBLEND'].values
-yerr = data['PDCSAP_FLUX_ERR'].values
-
-limb_darkening_coefficients = [0.4, 0.3]  # Replace with actual coefficients
-
-theta0 = [2459450.138346 - 2457000, 2.6599176523685, 0.0402805, 9.07, 89, 0., 0.]
-bounds = [[theta0[0] - 0.5, theta0[0] + 0.5],# bounds on t0
-         [theta0[1] - 0.5, theta0[1] + 0.5],# bounds on period
-         [0., 0.2],# bounds on rp/rstar
-         [0, 20], # bounds on a/rstar
-         [88,90], # bounds on inclination
-         [-1, 1],# bounds for sqrt(e)cos(w)
-         [-1, 1]]# bounds for sqrt(e)sin(w)
-
-nwalkers = 25
-
-theta0 = np.tile(theta0, (nwalkers, 1)) + 1e-4 * np.random.rand(nwalkers, len(theta0))
-
-
-s1 = keplersplinev2.keplersplinev2(t[t<t[0]+26], y[t<t[0]+26], bkspace=0.8)
-transit_fitter = TransitFit(t[t<t[0]+26],
-                               y[t<t[0]+26] / s1,
-                               yerr[t<t[0]+26], 
-                               limb_darkening_coefficients)
-
-derived_params, uncertainties = transit_fitter.fit_transit(nwalkers, \
-                           theta0=theta0, \
-                           bounds=bounds)
-
-
-labels=['t0', 'per', 'rp/rstar', 'a/rstar', 'inc (deg)', 'sqrt(e)cos(w)', 'sqrt(e)sin(w)']
-
-for i in range(len(labels)):
-    print(labels[i], derived_params[i], uncertainties[0][i], '/', uncertainties[1][i])
+    
+    
